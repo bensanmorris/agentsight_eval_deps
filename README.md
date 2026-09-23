@@ -10,7 +10,7 @@ It accompanies the evaluation in [bensanmorris/agentsight_eval](https://github.c
 
 | Path | What it is |
 |---|---|
-| `build-agentsight-rhel9.sh` | Build script (the same file as inside the bundle). Its `build` stage runs fully offline. |
+| `build-agentsight-rhel9.sh` | Build script; its `build` stage runs fully offline. **Use this copy**: it's newer than the one inside the bundle and keeps all work (including compiler temp files) out of `/tmp`. |
 | `v1.0.31/agentsight-v1.0.31-rhel9-bundle.tar.gz.part-0{0..3}` | The bundle, split into parts of ≤90 MB (GitHub rejects files over 100 MB) |
 | `v1.0.31/parts.sha256` | SHA-256 of each part |
 | `v1.0.31/agentsight-v1.0.31-rhel9-bundle.tar.gz.sha256` | SHA-256 of the reassembled bundle |
@@ -38,15 +38,31 @@ Build prerequisites come from your normal RHEL repos or Satellite:
 sudo dnf install -y gcc make clang llvm elfutils-libelf-devel zlib-devel binutils tar xz gzip
 ```
 
-Then:
+Then, from a directory on a filesystem with **about 5 GB free** (e.g. your home directory, **not** `/tmp`):
 
 ```bash
 git clone https://github.com/bensanmorris/agentsight_eval_deps.git
 cd agentsight_eval_deps
-./v1.0.31/reassemble.sh /tmp/agentsight-bundle
-./build-agentsight-rhel9.sh build --bundle /tmp/agentsight-bundle/agentsight-v1.0.31-rhel9-bundle.tar.gz
-agentsight --version        # agentsight 1.0.31, installed to ~/.local/bin
+./v1.0.31/reassemble.sh             # -> ./agentsight-bundle/ (~330 MB)
+./build-agentsight-rhel9.sh build --bundle agentsight-bundle/agentsight-v1.0.31-rhel9-bundle.tar.gz
+agentsight --version                # agentsight 1.0.31, installed to ~/.local/bin
 ```
+
+### Disk space and `/tmp`
+
+Nothing is written to `/tmp`. Everything happens under the current directory:
+
+| Item | Location | Size |
+|---|---|---|
+| Git clone (history + checked-out parts) | `./` | ~660 MB |
+| Reassembled bundle | `./agentsight-bundle/` | ~330 MB |
+| Build work dir: extracted source, Rust toolchain, compiler output; `TMPDIR` also points here | `./agentsight-rhel9-work/build.XXXXXX/` | peak ~2.4 GB, **deleted after a successful build**, kept after a failure (for its logs) |
+
+The build checks for 4 GB free before starting. To put the work directory elsewhere, use `--work-dir /path/with/space` (and `reassemble.sh /path/with/space`). `--min-free-gb 0` skips the check.
+
+When the build has succeeded you can reclaim space with `rm -rf agentsight-bundle`. You can delete the whole clone too: the installed binary in `~/.local/bin` is self-contained.
+
+Tested on RHEL 9.8 in a namespace with no network and a 50 MB `/tmp`. The previous version of the script failed there with "No space left on device", and this version completes.
 
 `build` verifies the bundle checksum and installs Rust into a temporary directory only (nothing system-wide). It builds the eBPF probes against the host's glibc, compiles the CLI with `cargo --offline --locked`, and refuses to install if any binary needs a newer glibc than the host has. It was tested on RHEL 9.8 inside a network namespace with no network access.
 

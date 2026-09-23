@@ -18,6 +18,10 @@
 #   # copy the tarball and its .sha256 to the air-gapped host, then:
 #   ./build-agentsight-rhel9.sh build --bundle agentsight-v1.0.31-rhel9-bundle.tar.gz --install-rpms
 #
+# Disk space: everything (including compiler temp files) goes under a work
+# directory, by default ./agentsight-rhel9-work in the current directory, not
+# /tmp. A build needs about 4 GB free there; a bundle about 2 GB.
+#
 # Run with -h for all options.
 
 set -euo pipefail
@@ -37,6 +41,8 @@ PREFIX="$HOME/.local/bin"
 WITH_RPMS=0
 INSTALL_RPMS=0
 KEEP_WORK=0
+MIN_FREE_GB=""
+WORK_BASE="$PWD/agentsight-rhel9-work"
 
 # ----------------------------------------------------------------- helpers ---
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
@@ -52,8 +58,12 @@ Usage: $(basename "$0") <bundle|build|all> [options]
 
 Common options:
   --version TAG        AgentSight git tag to build        (default: $AGENTSIGHT_VERSION)
-  --work-dir DIR       Scratch directory                  (default: mktemp)
-  --keep-work          Do not delete the scratch directory afterwards
+  --work-dir DIR       Scratch directory; also used as TMPDIR for all tools
+                       (default: a new directory under ./agentsight-rhel9-work)
+  --keep-work          Keep the scratch directory after a successful run
+                       (it is always kept after a failure, for the logs)
+  --min-free-gb N      Required free space in the work directory
+                       (default: 4 for build/all, 2 for bundle; 0 disables the check)
   -h, --help           Show this help
 
 bundle options:
@@ -80,21 +90,49 @@ system_glibc() { getconf GNU_LIBC_VERSION | awk '{print $2}'; }
 version_le() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
 
 TEMP_WORK=0
-setup_work_dir() {
+cleanup_work_dir() {  # remove an auto-created work dir after success; keep it after failure
+    local status=$?
+    [ "$TEMP_WORK" = 1 ] && [ -n "$WORK_DIR" ] || return 0
+    if [ "$status" -eq 0 ] && [ "$KEEP_WORK" != 1 ]; then
+        rm -rf "$WORK_DIR"
+        rmdir "$WORK_BASE" 2>/dev/null || true
+    else
+        warn "work directory kept: $WORK_DIR (delete it when finished)"
+    fi
+}
+
+check_free_space() {  # check_free_space <dir> <GB>
+    local dir="$1" need_gb="$2" avail_kb
+    [ "$need_gb" -gt 0 ] || return 0
+    avail_kb="$(df -Pk "$dir" | awk 'NR==2 {print $4}')"
+    if [ "$avail_kb" -lt $((need_gb * 1024 * 1024)) ]; then
+        die "only $((avail_kb / 1024)) MB free in $dir, need about ${need_gb} GB.
+       Run from a directory on a bigger filesystem, or pass --work-dir DIR (--min-free-gb 0 skips this check)."
+    fi
+}
+
+setup_work_dir() {  # setup_work_dir <default-min-free-gb>
     if [ -z "$WORK_DIR" ]; then
-        WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agentsight-rhel9.XXXXXX")"
+        check_free_space "$(dirname "$WORK_BASE")" "${MIN_FREE_GB:-$1}"
+        mkdir -p "$WORK_BASE"
+        WORK_DIR="$(mktemp -d "$WORK_BASE/$CMD.XXXXXX")"
         TEMP_WORK=1
-        [ "$KEEP_WORK" = 1 ] || trap 'rm -rf "$WORK_DIR"' EXIT
+        trap cleanup_work_dir EXIT
     else
         mkdir -p "$WORK_DIR"
+        check_free_space "$WORK_DIR" "${MIN_FREE_GB:-$1}"
     fi
-    log "work directory: $WORK_DIR"
+    # Keep every tool's temporary files (rustc, cc, cargo, git, the Rust
+    # installer) inside the work directory instead of a possibly small /tmp.
+    export TMPDIR="$WORK_DIR/tmp"
+    mkdir -p "$TMPDIR"
+    log "work directory: $WORK_DIR ($(df -Ph "$WORK_DIR" | awk 'NR==2 {print $4}') free)"
 }
 
 # ------------------------------------------------------------------ bundle ---
 cmd_bundle() {
     need git; need curl; need tar; need sha256sum
-    setup_work_dir
+    setup_work_dir 2
     local name="agentsight-${AGENTSIGHT_VERSION}-rhel9-bundle"
     local root="$WORK_DIR/$name"
     rm -rf "$root"; mkdir -p "$root"
@@ -200,7 +238,7 @@ cmd_build() {
     [ -n "$BUNDLE" ] || die "--bundle FILE is required for 'build'"
     [ -f "$BUNDLE" ] || die "bundle not found: $BUNDLE"
     need tar; need rpm
-    setup_work_dir
+    setup_work_dir 4
 
     if [ -f "$BUNDLE.sha256" ]; then
         log "verifying bundle checksum"
@@ -237,7 +275,7 @@ cmd_build() {
     local src="$SRC_ROOT/agentsight"
     log "building eBPF probes against system glibc $(system_glibc)"
     make -C "$src/bpf" -j"$(nproc)" process sslsniff stdiocap > "$WORK_DIR/bpf-build.log" 2>&1 \
-        || { tail -30 "$WORK_DIR/bpf-build.log" >&2; die "eBPF build failed (full log: $WORK_DIR/bpf-build.log, use --keep-work)"; }
+        || { tail -30 "$WORK_DIR/bpf-build.log" >&2; die "eBPF build failed (full log: $WORK_DIR/bpf-build.log)"; }
 
     # Replace the committed probe binaries (built against glibc 2.38) with ours.
     # The committed frontend in collector/vendor/frontend is used as-is (no Node.js needed).
@@ -247,7 +285,7 @@ cmd_build() {
 
     log "building agentsight CLI (offline)"
     ( cd "$src/collector" && cargo build --release --offline --locked ) > "$WORK_DIR/cargo-build.log" 2>&1 \
-        || { tail -30 "$WORK_DIR/cargo-build.log" >&2; die "cargo build failed (full log: $WORK_DIR/cargo-build.log, use --keep-work)"; }
+        || { tail -30 "$WORK_DIR/cargo-build.log" >&2; die "cargo build failed (full log: $WORK_DIR/cargo-build.log)"; }
 
     local bin="$src/collector/target/release/agentsight" sys need_glibc f
     sys="$(system_glibc)"
@@ -278,6 +316,7 @@ while [ $# -gt 0 ]; do
         --with-rpms)    WITH_RPMS=1; shift ;;
         --install-rpms) INSTALL_RPMS=1; shift ;;
         --keep-work)    KEEP_WORK=1; shift ;;
+        --min-free-gb)  MIN_FREE_GB="$2"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
         *)              die "unknown option: $1 (see --help)" ;;
     esac
@@ -290,9 +329,8 @@ case "$CMD" in
     build)  cmd_build ;;
     all)    cmd_bundle
             if [ "$TEMP_WORK" = 1 ]; then
-                trap - EXIT
                 [ "$KEEP_WORK" = 1 ] || rm -rf "$WORK_DIR"
-                WORK_DIR=""
+                WORK_DIR=""; TEMP_WORK=0
             fi
             cmd_build ;;
     -h|--help|help) usage ;;
