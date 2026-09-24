@@ -11,6 +11,7 @@ It accompanies the evaluation in [bensanmorris/agentsight_eval](https://github.c
 | Path | What it is |
 |---|---|
 | `build-agentsight-rhel9.sh` | Build script; its `build` stage runs fully offline. **Use this copy**: it's newer than the one inside the bundle and keeps all work (including compiler temp files) out of `/tmp`. |
+| `patches/v1.0.31/*.patch` | Patches that `build` applies automatically before compiling (see [Patches](#patches)) |
 | `v1.0.31/agentsight-v1.0.31-rhel9-bundle.tar.gz.part-0{0..3}` | The bundle, split into parts of ≤90 MB (GitHub rejects files over 100 MB) |
 | `v1.0.31/parts.sha256` | SHA-256 of each part |
 | `v1.0.31/agentsight-v1.0.31-rhel9-bundle.tar.gz.sha256` | SHA-256 of the reassembled bundle |
@@ -47,6 +48,16 @@ cd agentsight_eval_deps
 ./build-agentsight-rhel9.sh build --bundle agentsight-bundle/agentsight-v1.0.31-rhel9-bundle.tar.gz
 agentsight --version                # agentsight 1.0.31, installed to ~/.local/bin
 ```
+
+### Patches
+
+`build` applies every `*.patch` in `patches/<version>/` before compiling. It checks each one with a dry run first, logs the patch's SHA-256, and stops with a clear error if a patch doesn't apply. The bundle itself stays pristine upstream source.
+
+| Patch | Fixes |
+|---|---|
+| `0001-bpf-use-syscall_trace-structs-for-syscalls-tracepoints.patch` | AgentSight's syscall probes use the wrong tracepoint struct. On RHEL 9 (12-byte `trace_entry`) this makes stdio capture fail to attach (`-EACCES`) and file paths come out as garbage. It changes 29 lines, types only. See the [evaluation write-up](https://github.com/bensanmorris/agentsight_eval/blob/main/RESULTS.md#f31-fix-verified-on-rhel-98). |
+
+Options: `--no-patches` builds unmodified upstream; `--patches DIR` uses a different patch directory.
 
 ### Disk space and `/tmp`
 

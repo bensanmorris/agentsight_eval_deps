@@ -1,0 +1,265 @@
+diff --git a/bpf/process.bpf.c b/bpf/process.bpf.c
+index 0b8791e..7dd42d5 100644
+--- a/bpf/process.bpf.c
++++ b/bpf/process.bpf.c
+@@ -222,7 +222,7 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
+ 
+ /* Syscall tracepoint for openat */
+ SEC("tp/syscalls/sys_enter_openat")
+-int trace_openat(struct trace_event_raw_sys_enter *ctx)
++int trace_openat(struct syscall_trace_enter *ctx)
+ {
+ 	struct event *e;
+ 	pid_t pid;
+@@ -272,7 +272,7 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
+ 
+ /* Syscall tracepoint for open */
+ SEC("tp/syscalls/sys_enter_open")
+-int trace_open(struct trace_event_raw_sys_enter *ctx)
++int trace_open(struct syscall_trace_enter *ctx)
+ {
+ 	struct event *e;
+ 	pid_t pid;
+diff --git a/bpf/process_ext/bpf_fs.h b/bpf/process_ext/bpf_fs.h
+index f3714e7..d688f00 100644
+--- a/bpf/process_ext/bpf_fs.h
++++ b/bpf/process_ext/bpf_fs.h
+@@ -74,13 +74,13 @@ static __always_inline int agg_path_event(const char *user_path, u32 event_type)
+ /* --- unlink / unlinkat → FILE_DELETE --- */
+ 
+ SEC("tp/syscalls/sys_enter_unlinkat")
+-int trace_unlinkat(struct trace_event_raw_sys_enter *ctx)
++int trace_unlinkat(struct syscall_trace_enter *ctx)
+ {
+ 	return agg_path_event((const char *)ctx->args[1], EVENT_TYPE_FILE_DELETE);
+ }
+ 
+ SEC("tp/syscalls/sys_enter_unlink")
+-int trace_unlink(struct trace_event_raw_sys_enter *ctx)
++int trace_unlink(struct syscall_trace_enter *ctx)
+ {
+ 	return agg_path_event((const char *)ctx->args[0], EVENT_TYPE_FILE_DELETE);
+ }
+@@ -88,21 +88,21 @@ int trace_unlink(struct trace_event_raw_sys_enter *ctx)
+ /* --- rename / renameat / renameat2 → FILE_RENAME --- */
+ 
+ SEC("tp/syscalls/sys_enter_renameat2")
+-int trace_renameat2(struct trace_event_raw_sys_enter *ctx)
++int trace_renameat2(struct syscall_trace_enter *ctx)
+ {
+ 	/* newpath is args[3] */
+ 	return agg_path_event((const char *)ctx->args[3], EVENT_TYPE_FILE_RENAME);
+ }
+ 
+ SEC("tp/syscalls/sys_enter_renameat")
+-int trace_renameat(struct trace_event_raw_sys_enter *ctx)
++int trace_renameat(struct syscall_trace_enter *ctx)
+ {
+ 	/* renameat(olddirfd, oldpath, newdirfd, newpath): newpath is args[3] */
+ 	return agg_path_event((const char *)ctx->args[3], EVENT_TYPE_FILE_RENAME);
+ }
+ 
+ SEC("tp/syscalls/sys_enter_rename")
+-int trace_rename(struct trace_event_raw_sys_enter *ctx)
++int trace_rename(struct syscall_trace_enter *ctx)
+ {
+ 	/* rename(oldpath, newpath): newpath is args[1] */
+ 	return agg_path_event((const char *)ctx->args[1], EVENT_TYPE_FILE_RENAME);
+@@ -111,19 +111,19 @@ int trace_rename(struct trace_event_raw_sys_enter *ctx)
+ /* --- mkdir / mkdirat → DIR_CREATE --- */
+ 
+ SEC("tp/syscalls/sys_enter_mkdirat")
+-int trace_mkdirat(struct trace_event_raw_sys_enter *ctx)
++int trace_mkdirat(struct syscall_trace_enter *ctx)
+ {
+ 	return agg_path_event((const char *)ctx->args[1], EVENT_TYPE_DIR_CREATE);
+ }
+ 
+ SEC("tp/syscalls/sys_enter_mkdir")
+-int trace_mkdir(struct trace_event_raw_sys_enter *ctx)
++int trace_mkdir(struct syscall_trace_enter *ctx)
+ {
+ 	return agg_path_event((const char *)ctx->args[0], EVENT_TYPE_DIR_CREATE);
+ }
+ 
+ SEC("tp/syscalls/sys_enter_ftruncate")
+-int trace_ftruncate(struct trace_event_raw_sys_enter *ctx)
++int trace_ftruncate(struct syscall_trace_enter *ctx)
+ {
+ 	if (!trace_fs_mutations)
+ 		return 0;
+@@ -142,7 +142,7 @@ int trace_ftruncate(struct trace_event_raw_sys_enter *ctx)
+ }
+ 
+ SEC("tp/syscalls/sys_enter_chdir")
+-int trace_chdir(struct trace_event_raw_sys_enter *ctx)
++int trace_chdir(struct syscall_trace_enter *ctx)
+ {
+ 	if (!trace_fs_mutations)
+ 		return 0;
+diff --git a/bpf/process_ext/bpf_mem.h b/bpf/process_ext/bpf_mem.h
+index 46837c7..76de599 100644
+--- a/bpf/process_ext/bpf_mem.h
++++ b/bpf/process_ext/bpf_mem.h
+@@ -8,7 +8,7 @@
+  */
+ 
+ SEC("tp/syscalls/sys_enter_mmap")
+-int trace_mmap(struct trace_event_raw_sys_enter *ctx)
++int trace_mmap(struct syscall_trace_enter *ctx)
+ {
+ 	if (!trace_memory)
+ 		return 0;
+diff --git a/bpf/process_ext/bpf_net.h b/bpf/process_ext/bpf_net.h
+index 765de9a..e881778 100644
+--- a/bpf/process_ext/bpf_net.h
++++ b/bpf/process_ext/bpf_net.h
+@@ -9,7 +9,7 @@
+  */
+ 
+ /* Read sockaddr_in from userspace and format as "A.B.C.D:PORT" */
+-static __always_inline void read_and_format_sockaddr(struct trace_event_raw_sys_enter *ctx,
++static __always_inline void read_and_format_sockaddr(struct syscall_trace_enter *ctx,
+ 						     char *detail, int detail_len)
+ {
+ 	struct sockaddr_in addr = {};
+@@ -51,7 +51,7 @@ static __always_inline void format_family(char *buf, int buf_len, u16 family)
+ }
+ 
+ SEC("tp/syscalls/sys_enter_bind")
+-int trace_bind(struct trace_event_raw_sys_enter *ctx)
++int trace_bind(struct syscall_trace_enter *ctx)
+ {
+ 	if (!trace_network)
+ 		return 0;
+@@ -76,7 +76,7 @@ int trace_bind(struct trace_event_raw_sys_enter *ctx)
+ }
+ 
+ SEC("tp/syscalls/sys_enter_listen")
+-int trace_listen(struct trace_event_raw_sys_enter *ctx)
++int trace_listen(struct syscall_trace_enter *ctx)
+ {
+ 	if (!trace_network)
+ 		return 0;
+@@ -95,7 +95,7 @@ int trace_listen(struct trace_event_raw_sys_enter *ctx)
+ }
+ 
+ SEC("tp/syscalls/sys_enter_connect")
+-int trace_connect(struct trace_event_raw_sys_enter *ctx)
++int trace_connect(struct syscall_trace_enter *ctx)
+ {
+ 	if (!trace_network)
+ 		return 0;
+diff --git a/bpf/process_ext/bpf_signals.h b/bpf/process_ext/bpf_signals.h
+index 2618344..e3ef5a9 100644
+--- a/bpf/process_ext/bpf_signals.h
++++ b/bpf/process_ext/bpf_signals.h
+@@ -44,7 +44,7 @@ static __always_inline int write_str(char *buf, int pos, int buf_len, const char
+ }
+ 
+ SEC("tp/syscalls/sys_enter_setpgid")
+-int trace_setpgid(struct trace_event_raw_sys_enter *ctx)
++int trace_setpgid(struct syscall_trace_enter *ctx)
+ {
+ 	if (!trace_signals)
+ 		return 0;
+@@ -70,7 +70,7 @@ int trace_setpgid(struct trace_event_raw_sys_enter *ctx)
+ }
+ 
+ SEC("tp/syscalls/sys_enter_setsid")
+-int trace_setsid(struct trace_event_raw_sys_enter *ctx)
++int trace_setsid(struct syscall_trace_enter *ctx)
+ {
+ 	if (!trace_signals)
+ 		return 0;
+@@ -93,7 +93,7 @@ int trace_setsid(struct trace_event_raw_sys_enter *ctx)
+ }
+ 
+ SEC("tp/syscalls/sys_enter_kill")
+-int trace_kill(struct trace_event_raw_sys_enter *ctx)
++int trace_kill(struct syscall_trace_enter *ctx)
+ {
+ 	if (!trace_signals)
+ 		return 0;
+diff --git a/bpf/process_ext/bpf_write.h b/bpf/process_ext/bpf_write.h
+index 7a69aeb..060b971 100644
+--- a/bpf/process_ext/bpf_write.h
++++ b/bpf/process_ext/bpf_write.h
+@@ -50,37 +50,37 @@ static __always_inline int trace_write_exit_common(long ret)
+ }
+ 
+ SEC("tp/syscalls/sys_enter_write")
+-int trace_write_enter(struct trace_event_raw_sys_enter *ctx)
++int trace_write_enter(struct syscall_trace_enter *ctx)
+ {
+ 	return trace_write_enter_common((int)ctx->args[0]);
+ }
+ 
+ SEC("tp/syscalls/sys_exit_write")
+-int trace_write_exit(struct trace_event_raw_sys_exit *ctx)
++int trace_write_exit(struct syscall_trace_exit *ctx)
+ {
+ 	return trace_write_exit_common(ctx->ret);
+ }
+ 
+ SEC("tp/syscalls/sys_enter_pwrite64")
+-int trace_pwrite64_enter(struct trace_event_raw_sys_enter *ctx)
++int trace_pwrite64_enter(struct syscall_trace_enter *ctx)
+ {
+ 	return trace_write_enter_common((int)ctx->args[0]);
+ }
+ 
+ SEC("tp/syscalls/sys_exit_pwrite64")
+-int trace_pwrite64_exit(struct trace_event_raw_sys_exit *ctx)
++int trace_pwrite64_exit(struct syscall_trace_exit *ctx)
+ {
+ 	return trace_write_exit_common(ctx->ret);
+ }
+ 
+ SEC("tp/syscalls/sys_enter_writev")
+-int trace_writev_enter(struct trace_event_raw_sys_enter *ctx)
++int trace_writev_enter(struct syscall_trace_enter *ctx)
+ {
+ 	return trace_write_enter_common((int)ctx->args[0]);
+ }
+ 
+ SEC("tp/syscalls/sys_exit_writev")
+-int trace_writev_exit(struct trace_event_raw_sys_exit *ctx)
++int trace_writev_exit(struct syscall_trace_exit *ctx)
+ {
+ 	return trace_write_exit_common(ctx->ret);
+ }
+diff --git a/bpf/stdiocap.bpf.c b/bpf/stdiocap.bpf.c
+index 0b32dbf..1412209 100644
+--- a/bpf/stdiocap.bpf.c
++++ b/bpf/stdiocap.bpf.c
+@@ -148,25 +148,25 @@ static __always_inline int exit_common(long ret)
+ }
+ 
+ SEC("tp/syscalls/sys_enter_read")
+-int trace_enter_read(struct trace_event_raw_sys_enter *ctx)
++int trace_enter_read(struct syscall_trace_enter *ctx)
+ {
+ 	return enter_common((int)ctx->args[0], (const void *)ctx->args[1], true);
+ }
+ 
+ SEC("tp/syscalls/sys_exit_read")
+-int trace_exit_read(struct trace_event_raw_sys_exit *ctx)
++int trace_exit_read(struct syscall_trace_exit *ctx)
+ {
+ 	return exit_common(ctx->ret);
+ }
+ 
+ SEC("tp/syscalls/sys_enter_write")
+-int trace_enter_write(struct trace_event_raw_sys_enter *ctx)
++int trace_enter_write(struct syscall_trace_enter *ctx)
+ {
+ 	return enter_common((int)ctx->args[0], (const void *)ctx->args[1], false);
+ }
+ 
+ SEC("tp/syscalls/sys_exit_write")
+-int trace_exit_write(struct trace_event_raw_sys_exit *ctx)
++int trace_exit_write(struct syscall_trace_exit *ctx)
+ {
+ 	return exit_common(ctx->ret);
+ }

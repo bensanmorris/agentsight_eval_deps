@@ -22,6 +22,10 @@
 # directory, by default ./agentsight-rhel9-work in the current directory, not
 # /tmp. A build needs about 4 GB free there; a bundle about 2 GB.
 #
+# Patches: before compiling, 'build' applies any patches found in
+# patches/<agentsight-version>/ next to this script (or in the bundle, or
+# --patches DIR). v1.0.31 ships a fix for the eBPF syscall probes on RHEL 9.
+#
 # Run with -h for all options.
 
 set -euo pipefail
@@ -43,6 +47,9 @@ INSTALL_RPMS=0
 KEEP_WORK=0
 MIN_FREE_GB=""
 WORK_BASE="$PWD/agentsight-rhel9-work"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PATCH_DIR=""
+NO_PATCHES=0
 
 # ----------------------------------------------------------------- helpers ---
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
@@ -76,6 +83,9 @@ build options:
   --bundle FILE        Bundle tarball from the 'bundle' stage (required for 'build')
   --prefix DIR         Install directory for the agentsight binary (default: $PREFIX)
   --install-rpms       Install the bundled RPMs with 'sudo dnf' from local files only
+  --patches DIR        Apply *.patch files from DIR (default: patches/<version>/ next
+                       to this script, else patches/<version>/ inside the bundle)
+  --no-patches         Build unmodified upstream source
 
 Environment overrides: AGENTSIGHT_REPO, AGENTSIGHT_VERSION, RUST_VERSION, RUST_DIST_URL
 EOF
@@ -190,6 +200,11 @@ cmd_bundle() {
         printf 'created_on=%q\n'         "$(uname -srm)"
     } > "$root/BUNDLE-INFO"
     cp "$0" "$root/build-agentsight-rhel9.sh"
+    if [ -d "$SCRIPT_DIR/patches/$AGENTSIGHT_VERSION" ]; then
+        mkdir -p "$root/patches"
+        cp -r "$SCRIPT_DIR/patches/$AGENTSIGHT_VERSION" "$root/patches/"
+        log "included patches: $(ls "$root/patches/$AGENTSIGHT_VERSION" | tr '\n' ' ')"
+    fi
 
     mkdir -p "$OUT_DIR"
     local tarball="$OUT_DIR/$name.tar.gz"
@@ -234,6 +249,37 @@ check_runtime_env() {
     fi
 }
 
+apply_patches() {  # apply_patches <source-dir> <agentsight-version>
+    local src="$1" ver="$2" dir="" p
+    if [ "$NO_PATCHES" = 1 ]; then
+        warn "--no-patches: building unmodified upstream source"
+        return 0
+    fi
+    if [ -n "$PATCH_DIR" ]; then
+        dir="$PATCH_DIR"
+        [ -d "$dir" ] || die "patch directory not found: $dir"
+    elif [ -d "$SCRIPT_DIR/patches/$ver" ]; then
+        dir="$SCRIPT_DIR/patches/$ver"
+    elif [ -d "$SRC_ROOT/patches/$ver" ]; then
+        dir="$SRC_ROOT/patches/$ver"
+    fi
+    if [ -z "$dir" ] || ! ls "$dir"/*.patch >/dev/null 2>&1; then
+        log "no patches for $ver"
+        return 0
+    fi
+    for p in "$dir"/*.patch; do
+        if command -v git >/dev/null 2>&1; then
+            ( cd "$src" && git apply --check "$p" 2>"$WORK_DIR/patch.err" && git apply "$p" ) \
+                || { cat "$WORK_DIR/patch.err" >&2; die "patch does not apply: $(basename "$p") (use --no-patches to build upstream as-is)"; }
+        else
+            need patch
+            patch -d "$src" -p1 --dry-run -s < "$p" >"$WORK_DIR/patch.err" 2>&1 && patch -d "$src" -p1 -s < "$p" \
+                || { cat "$WORK_DIR/patch.err" >&2; die "patch does not apply: $(basename "$p") (use --no-patches to build upstream as-is)"; }
+        fi
+        log "applied patch: $(basename "$p") (sha256 $(sha256sum "$p" | cut -c1-12))"
+    done
+}
+
 cmd_build() {
     [ -n "$BUNDLE" ] || die "--bundle FILE is required for 'build'"
     [ -f "$BUNDLE" ] || die "bundle not found: $BUNDLE"
@@ -273,6 +319,8 @@ cmd_build() {
     printf '\n[net]\noffline = true\n' >> "$CARGO_HOME/config.toml"
 
     local src="$SRC_ROOT/agentsight"
+    apply_patches "$src" "$agentsight_version"
+
     log "building eBPF probes against system glibc $(system_glibc)"
     make -C "$src/bpf" -j"$(nproc)" process sslsniff stdiocap > "$WORK_DIR/bpf-build.log" 2>&1 \
         || { tail -30 "$WORK_DIR/bpf-build.log" >&2; die "eBPF build failed (full log: $WORK_DIR/bpf-build.log)"; }
@@ -317,6 +365,8 @@ while [ $# -gt 0 ]; do
         --install-rpms) INSTALL_RPMS=1; shift ;;
         --keep-work)    KEEP_WORK=1; shift ;;
         --min-free-gb)  MIN_FREE_GB="$2"; shift 2 ;;
+        --patches)      PATCH_DIR="$(realpath -m "$2")"; shift 2 ;;
+        --no-patches)   NO_PATCHES=1; shift ;;
         -h|--help)      usage; exit 0 ;;
         *)              die "unknown option: $1 (see --help)" ;;
     esac
