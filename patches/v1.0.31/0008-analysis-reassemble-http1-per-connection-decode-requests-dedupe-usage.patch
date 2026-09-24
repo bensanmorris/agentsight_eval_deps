@@ -1,0 +1,1151 @@
+diff --git a/collector/src/cmd_trace.rs b/collector/src/cmd_trace.rs
+index 80f0fbb..760161c 100644
+--- a/collector/src/cmd_trace.rs
++++ b/collector/src/cmd_trace.rs
+@@ -627,7 +627,11 @@ pub(crate) fn add_http_analyzers(
+     http_filter: &[String],
+     disable_auth_removal: bool,
+ ) -> BinaryRunner {
+-    let mut runner = runner.add_analyzer(Box::new(SSEProcessor::new_with_timeout(30000)));
++    // Connection-tracked SSL events (sslsniff conn_id) are reassembled by the
++    // HTTP parser; the pre-parser SSE merge only handles untracked ones.
++    let mut runner = runner.add_analyzer(Box::new(
++        SSEProcessor::new_with_timeout(30000).defer_connection_tracked_ssl(),
++    ));
+     let parser = if include_raw_data {
+         HTTPParser::new()
+     } else {
+diff --git a/ext/analysis/src/analyzers/http1_stream.rs b/ext/analysis/src/analyzers/http1_stream.rs
+new file mode 100644
+index 0000000..1285a6e
+--- /dev/null
++++ b/ext/analysis/src/analyzers/http1_stream.rs
+@@ -0,0 +1,480 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 eunomia-bpf org.
++
++//! HTTP/1.x message framing across SSL events of one TLS connection.
++//!
++//! SSL_write/SSL_read calls don't line up with HTTP messages: a request body
++//! can span several 16 KB writes, and a streamed (chunked) response arrives as
++//! many reads, interleaved with other connections on the same thread. When
++//! sslsniff reports the connection (`conn_id`), this tracker buffers each
++//! connection and direction separately and hands back complete messages, with
++//! chunked bodies already decoded.
++
++use crate::event::Event;
++use std::collections::{HashMap, HashSet, VecDeque};
++
++/// Largest body kept per message; bigger messages are dropped whole rather
++/// than emitted truncated.
++pub(super) const MAX_HTTP1_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
++const MAX_HTTP1_HEAD_BYTES: usize = 64 * 1024;
++const MAX_HTTP1_STREAMS: usize = 1024;
++
++const METHODS: [&[u8]; 9] = [
++    b"GET ",
++    b"POST ",
++    b"PUT ",
++    b"PATCH ",
++    b"DELETE ",
++    b"HEAD ",
++    b"OPTIONS ",
++    b"CONNECT ",
++    b"TRACE ",
++];
++
++/// (pid, conn_id, rw) – one byte stream per connection and direction.
++type StreamKey = (u32, u64, u8);
++
++pub(super) struct Http1Message {
++    /// Start line and headers, without the terminating blank line.
++    pub head: Vec<u8>,
++    /// Body with any chunked transfer encoding removed (still content-encoded).
++    pub body: Vec<u8>,
++    /// Event that carried the start of the message.
++    pub first_event: Event,
++    /// Timestamp of the event that completed the message.
++    pub last_timestamp: u64,
++    pub was_chunked: bool,
++    pub is_request: bool,
++}
++
++pub(super) enum Feed {
++    /// Not (or no longer) HTTP/1.x framing on this connection: use the
++    /// stateless/HTTP2/WebSocket paths for this event.
++    NotHttp1,
++    /// Bytes were consumed; zero or more messages completed.
++    Consumed(Vec<Http1Message>),
++}
++
++enum Phase {
++    Head,
++    Fixed(usize),
++    ChunkSize,
++    ChunkData(usize),
++    ChunkDataEnd,
++    Trailers,
++}
++
++struct Stream {
++    buf: Vec<u8>,
++    phase: Phase,
++    head: Vec<u8>,
++    body: Vec<u8>,
++    chunked: bool,
++    is_request: bool,
++    first_event: Option<Event>,
++    last_seen: u64,
++}
++
++impl Stream {
++    fn new() -> Self {
++        Self {
++            buf: Vec::new(),
++            phase: Phase::Head,
++            head: Vec::new(),
++            body: Vec::new(),
++            chunked: false,
++            is_request: false,
++            first_event: None,
++            last_seen: 0,
++        }
++    }
++
++    fn idle(&self) -> bool {
++        matches!(self.phase, Phase::Head) && self.buf.is_empty()
++    }
++
++    fn reset(&mut self) {
++        *self = Self {
++            last_seen: self.last_seen,
++            ..Self::new()
++        };
++    }
++}
++
++#[derive(Default)]
++pub(super) struct Http1Tracker {
++    streams: HashMap<StreamKey, Stream>,
++    /// Per connection: for each request sent, whether it was HEAD (its
++    /// response has no body even with a Content-Length).
++    head_requests: HashMap<(u32, u64), VecDeque<bool>>,
++    /// Connections switched to another protocol (101), e.g. WebSocket.
++    upgraded: HashSet<(u32, u64)>,
++}
++
++pub(super) fn starts_like_http1(bytes: &[u8]) -> bool {
++    if bytes.starts_with(b"HTTP/1.") {
++        return true;
++    }
++    let Some(method) = METHODS.iter().find(|m| bytes.starts_with(m)) else {
++        return false;
++    };
++    // The request line must end in HTTP/1.x (this also rules out HTTP/2's
++    // "PRI * HTTP/2.0" preface, which isn't a listed method anyway).
++    let line_end = find(bytes, b"\r\n").unwrap_or(bytes.len());
++    let line = &bytes[method.len()..line_end];
++    line_end == bytes.len() || line.windows(7).any(|w| w == b"HTTP/1.")
++}
++
++fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++    haystack.windows(needle.len()).position(|w| w == needle)
++}
++
++fn header_value<'a>(head: &'a [u8], name: &str) -> Option<&'a [u8]> {
++    head.split(|&b| b == b'\n').skip(1).find_map(|line| {
++        let line = line.strip_suffix(b"\r").unwrap_or(line);
++        let colon = line.iter().position(|&b| b == b':')?;
++        line[..colon]
++            .eq_ignore_ascii_case(name.as_bytes())
++            .then(|| trim(&line[colon + 1..]))
++    })
++}
++
++fn trim(mut s: &[u8]) -> &[u8] {
++    while let [b' ' | b'\t', rest @ ..] = s {
++        s = rest;
++    }
++    while let [rest @ .., b' ' | b'\t'] = s {
++        s = rest;
++    }
++    s
++}
++
++fn status_code(head: &[u8]) -> Option<u16> {
++    let line_end = find(head, b"\r\n").unwrap_or(head.len());
++    let mut parts = head[..line_end].split(|&b| b == b' ');
++    parts.next()?;
++    std::str::from_utf8(parts.next()?).ok()?.parse().ok()
++}
++
++impl Http1Tracker {
++    pub(super) fn feed(&mut self, event: &Event, conn_id: u64, rw: u8, bytes: &[u8]) -> Feed {
++        let conn = (event.pid, conn_id);
++        if self.upgraded.contains(&conn) {
++            return Feed::NotHttp1;
++        }
++        let key = (event.pid, conn_id, rw);
++        let starts_message = starts_like_http1(bytes);
++        let stream_idle = self.streams.get(&key).is_none_or(Stream::idle);
++        if stream_idle && !starts_message {
++            // Mid-stream attach, or a protocol we don't frame here.
++            return Feed::NotHttp1;
++        }
++
++        self.evict_if_full(key);
++        let stream = self.streams.entry(key).or_insert_with(Stream::new);
++        stream.last_seen = event.timestamp;
++        if stream.first_event.is_none() {
++            stream.first_event = Some(event.clone());
++        }
++        if stream.buf.len() + bytes.len() > MAX_HTTP1_MESSAGE_BYTES + MAX_HTTP1_HEAD_BYTES {
++            stream.reset();
++            return Feed::Consumed(Vec::new());
++        }
++        stream.buf.extend_from_slice(bytes);
++
++        let mut done = Vec::new();
++        loop {
++            match Self::step(stream, &mut self.head_requests, conn) {
++                Step::NeedMore => break,
++                Step::Error => {
++                    stream.reset();
++                    break;
++                }
++                Step::Complete => {
++                    let first_event = stream
++                        .first_event
++                        .take()
++                        .unwrap_or_else(|| event.clone());
++                    let msg = Http1Message {
++                        head: std::mem::take(&mut stream.head),
++                        body: std::mem::take(&mut stream.body),
++                        first_event,
++                        last_timestamp: event.timestamp,
++                        was_chunked: stream.chunked,
++                        is_request: stream.is_request,
++                    };
++                    stream.phase = Phase::Head;
++                    stream.chunked = false;
++                    if !msg.is_request && status_code(&msg.head) == Some(101) {
++                        self.upgraded.insert(conn);
++                    }
++                    done.push(msg);
++                    if stream.buf.is_empty() {
++                        break;
++                    }
++                    // A pipelined message starts in this same event.
++                    stream.first_event = Some(event.clone());
++                }
++            }
++        }
++        if self.upgraded.contains(&conn) {
++            self.streams.retain(|k, _| (k.0, k.1) != conn);
++        }
++        Feed::Consumed(done)
++    }
++
++    fn step(
++        stream: &mut Stream,
++        head_requests: &mut HashMap<(u32, u64), VecDeque<bool>>,
++        conn: (u32, u64),
++    ) -> Step {
++        match stream.phase {
++            Phase::Head => {
++                let Some(end) = find(&stream.buf, b"\r\n\r\n") else {
++                    return if stream.buf.len() > MAX_HTTP1_HEAD_BYTES {
++                        Step::Error
++                    } else {
++                        Step::NeedMore
++                    };
++                };
++                if !starts_like_http1(&stream.buf) {
++                    return Step::Error;
++                }
++                stream.head = stream.buf.drain(..end + 4).take(end).collect();
++                stream.is_request = !stream.head.starts_with(b"HTTP/");
++                let head = &stream.head;
++                let chunked = header_value(head, "transfer-encoding")
++                    .is_some_and(|v| v.to_ascii_lowercase().windows(7).any(|w| w == b"chunked"));
++                let content_length = header_value(head, "content-length")
++                    .and_then(|v| std::str::from_utf8(v).ok()?.parse::<usize>().ok());
++                if stream.is_request {
++                    head_requests
++                        .entry(conn)
++                        .or_default()
++                        .push_back(head.starts_with(b"HEAD "));
++                    if chunked {
++                        stream.chunked = true;
++                        stream.phase = Phase::ChunkSize;
++                    } else {
++                        match content_length {
++                            Some(n) if n > 0 => stream.phase = Phase::Fixed(n),
++                            _ => return Step::Complete,
++                        }
++                    }
++                } else {
++                    let was_head = head_requests
++                        .get_mut(&conn)
++                        .and_then(VecDeque::pop_front)
++                        .unwrap_or(false);
++                    let status = status_code(head).unwrap_or(200);
++                    if was_head || (100..200).contains(&status) || status == 204 || status == 304 {
++                        return Step::Complete;
++                    }
++                    if chunked {
++                        stream.chunked = true;
++                        stream.phase = Phase::ChunkSize;
++                    } else {
++                        match content_length {
++                            Some(0) => return Step::Complete,
++                            Some(n) => stream.phase = Phase::Fixed(n),
++                            // Delimited by connection close, which isn't observed:
++                            // keep what arrived with the head.
++                            None => {
++                                stream.body = std::mem::take(&mut stream.buf);
++                                return Step::Complete;
++                            }
++                        }
++                    }
++                }
++                if stream.buf.is_empty() {
++                    Step::NeedMore
++                } else {
++                    Self::step(stream, head_requests, conn)
++                }
++            }
++            Phase::Fixed(remaining) => {
++                let take = remaining.min(stream.buf.len());
++                stream.body.extend(stream.buf.drain(..take));
++                if take == remaining {
++                    Step::Complete
++                } else {
++                    stream.phase = Phase::Fixed(remaining - take);
++                    Step::NeedMore
++                }
++            }
++            Phase::ChunkSize => {
++                let Some(nl) = find(&stream.buf, b"\r\n") else {
++                    return if stream.buf.len() > 1024 { Step::Error } else { Step::NeedMore };
++                };
++                let line: Vec<u8> = stream.buf.drain(..nl + 2).take(nl).collect();
++                let size_hex = line.split(|&b| b == b';').next().unwrap_or_default();
++                let Some(size) = std::str::from_utf8(trim(size_hex))
++                    .ok()
++                    .and_then(|s| usize::from_str_radix(s, 16).ok())
++                else {
++                    return Step::Error;
++                };
++                if stream.body.len() + size > MAX_HTTP1_MESSAGE_BYTES {
++                    return Step::Error;
++                }
++                stream.phase = if size == 0 { Phase::Trailers } else { Phase::ChunkData(size) };
++                Self::step(stream, head_requests, conn)
++            }
++            Phase::ChunkData(remaining) => {
++                let take = remaining.min(stream.buf.len());
++                stream.body.extend(stream.buf.drain(..take));
++                if take == remaining {
++                    stream.phase = Phase::ChunkDataEnd;
++                    Self::step(stream, head_requests, conn)
++                } else {
++                    stream.phase = Phase::ChunkData(remaining - take);
++                    Step::NeedMore
++                }
++            }
++            Phase::ChunkDataEnd => {
++                if stream.buf.len() < 2 {
++                    return Step::NeedMore;
++                }
++                if &stream.buf[..2] != b"\r\n" {
++                    return Step::Error;
++                }
++                stream.buf.drain(..2);
++                stream.phase = Phase::ChunkSize;
++                Self::step(stream, head_requests, conn)
++            }
++            Phase::Trailers => {
++                if stream.buf.starts_with(b"\r\n") {
++                    stream.buf.drain(..2);
++                    return Step::Complete;
++                }
++                match find(&stream.buf, b"\r\n\r\n") {
++                    Some(end) => {
++                        stream.buf.drain(..end + 4);
++                        Step::Complete
++                    }
++                    None => Step::NeedMore,
++                }
++            }
++        }
++    }
++
++    fn evict_if_full(&mut self, keep: StreamKey) {
++        if self.streams.len() < MAX_HTTP1_STREAMS || self.streams.contains_key(&keep) {
++            return;
++        }
++        if let Some(oldest) = self
++            .streams
++            .iter()
++            .min_by_key(|(_, s)| s.last_seen)
++            .map(|(k, _)| *k)
++        {
++            self.streams.remove(&oldest);
++        }
++        if self.head_requests.len() > MAX_HTTP1_STREAMS {
++            self.head_requests.clear();
++        }
++    }
++}
++
++enum Step {
++    NeedMore,
++    Complete,
++    Error,
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    fn ev(ts: u64) -> Event {
++        Event::new_with_timestamp(ts, "ssl".into(), 1, "t".into(), json!({}))
++    }
++
++    fn consumed(f: Feed) -> Vec<Http1Message> {
++        match f {
++            Feed::Consumed(m) => m,
++            Feed::NotHttp1 => panic!("expected Consumed"),
++        }
++    }
++
++    #[test]
++    fn request_body_split_across_writes() {
++        let mut t = Http1Tracker::default();
++        let body = vec![0xC3u8; 40_000];
++        let mut bytes = format!("POST /v1/messages HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
++        bytes.extend(&body);
++        let mut out = Vec::new();
++        for (i, part) in bytes.chunks(16384).enumerate() {
++            out.extend(consumed(t.feed(&ev(i as u64), 7, 1, part)));
++        }
++        assert_eq!(out.len(), 1);
++        assert!(out[0].is_request);
++        assert_eq!(out[0].body, body);
++        assert_eq!(out[0].first_event.timestamp, 0);
++    }
++
++    #[test]
++    fn chunked_response_interleaved_with_other_connection() {
++        let mut t = Http1Tracker::default();
++        let a = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
++        let b = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
++        let a2 = b"6\r\n world\r\n0\r\n\r\n";
++        assert!(consumed(t.feed(&ev(1), 10, 0, a)).is_empty());
++        let other = consumed(t.feed(&ev(2), 20, 0, b));
++        assert_eq!(other.len(), 1);
++        assert_eq!(other[0].body, b"{}");
++        let done = consumed(t.feed(&ev(3), 10, 0, a2));
++        assert_eq!(done.len(), 1);
++        assert_eq!(done[0].body, b"hello world");
++        assert!(done[0].was_chunked);
++        assert_eq!(done[0].last_timestamp, 3);
++    }
++
++    #[test]
++    fn head_response_and_no_body_statuses() {
++        let mut t = Http1Tracker::default();
++        assert_eq!(consumed(t.feed(&ev(1), 5, 1, b"HEAD /x HTTP/1.1\r\nHost: h\r\n\r\n")).len(), 1);
++        let r = consumed(t.feed(&ev(2), 5, 0, b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n"));
++        assert_eq!(r.len(), 1);
++        assert!(r[0].body.is_empty());
++        let r = consumed(t.feed(&ev(3), 5, 0, b"HTTP/1.1 304 Not Modified\r\n\r\n"));
++        assert_eq!(r.len(), 1);
++    }
++
++    #[test]
++    fn pipelined_messages_in_one_event() {
++        let mut t = Http1Tracker::default();
++        let bytes = b"GET /a HTTP/1.1\r\nHost: h\r\n\r\nPOST /b HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
++        let out = consumed(t.feed(&ev(1), 5, 1, bytes));
++        assert_eq!(out.len(), 2);
++        assert_eq!(out[1].body, b"abc");
++    }
++
++    #[test]
++    fn mid_stream_and_http2_are_not_http1() {
++        let mut t = Http1Tracker::default();
++        assert!(matches!(t.feed(&ev(1), 5, 0, b"\x1f\x8b\x08garbage"), Feed::NotHttp1));
++        assert!(matches!(t.feed(&ev(2), 5, 1, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), Feed::NotHttp1));
++        assert!(!starts_like_http1(b"GET / HTTP/2\r\n"));
++    }
++
++    #[test]
++    fn upgrade_hands_connection_back() {
++        let mut t = Http1Tracker::default();
++        consumed(t.feed(&ev(1), 5, 1, b"GET /ws HTTP/1.1\r\nUpgrade: websocket\r\n\r\n"));
++        let r = consumed(t.feed(&ev(2), 5, 0, b"HTTP/1.1 101 Switching Protocols\r\n\r\n"));
++        assert_eq!(r.len(), 1);
++        assert!(matches!(t.feed(&ev(3), 5, 1, b"GET /not-http-anymore HTTP/1.1\r\n\r\n"), Feed::NotHttp1));
++    }
++
++    #[test]
++    fn bad_chunk_size_resets_stream() {
++        let mut t = Http1Tracker::default();
++        let out = consumed(t.feed(&ev(1), 5, 0, b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"));
++        assert!(out.is_empty());
++        // Next message on the connection is framed normally again.
++        let out = consumed(t.feed(&ev(2), 5, 0, b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx"));
++        assert_eq!(out.len(), 1);
++    }
++}
+diff --git a/ext/analysis/src/analyzers/http_decompressor.rs b/ext/analysis/src/analyzers/http_decompressor.rs
+index 8db2ada..34f53a5 100644
+--- a/ext/analysis/src/analyzers/http_decompressor.rs
++++ b/ext/analysis/src/analyzers/http_decompressor.rs
+@@ -22,7 +22,11 @@ impl HTTPDecompressor {
+         if event.source != "http_parser" {
+             return event;
+         }
+-        if event.data.get("message_type").and_then(Value::as_str) != Some("response") {
++        // Requests too: Claude Code gzips its /v1/messages request bodies.
++        if !matches!(
++            event.data.get("message_type").and_then(Value::as_str),
++            Some("request" | "response")
++        ) {
+             return event;
+         }
+ 
+diff --git a/ext/analysis/src/analyzers/http_parser.rs b/ext/analysis/src/analyzers/http_parser.rs
+index 760cf35..0c84522 100644
+--- a/ext/analysis/src/analyzers/http_parser.rs
++++ b/ext/analysis/src/analyzers/http_parser.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MIT
+ // Copyright (c) 2026 eunomia-bpf org.
+ 
++use super::http1_stream::{Feed, Http1Message, Http1Tracker};
+ use super::protocol_events::HTTPEvent;
+ use super::{Analyzer, AnalyzerError};
+ use crate::event::Event;
+@@ -22,6 +23,7 @@ pub struct HTTPParser {
+     include_raw_data: bool,
+     http2: HTTP2State,
+     websocket: WebSocketState,
++    http1: Http1Tracker,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -117,6 +119,7 @@ impl HTTPParser {
+             include_raw_data: true,
+             http2: HTTP2State::default(),
+             websocket: WebSocketState::default(),
++            http1: Http1Tracker::default(),
+         }
+     }
+ 
+@@ -297,12 +300,15 @@ impl HTTPParser {
+             content_length,
+             original_source: "ssl".to_string(),
+             raw_data: include_raw_data.then_some(parsed_message.raw_data),
++            conn_id: None,
++            thread_tid: None,
+         }
+         .to_event(original_event)
+     }
+ 
+     /// Handle SSL events (HTTP request/response data)
+     fn handle_ssl_event(
++        http1: &mut Http1Tracker,
+         http2: &mut HTTP2State,
+         websocket: &mut WebSocketState,
+         event: Event,
+@@ -315,6 +321,25 @@ impl HTTPParser {
+             None => return vec![event],
+         };
+ 
++        // With a connection id, frame HTTP/1.x across events of that
++        // connection only (several connections can share one thread).
++        let conn_id = ssl_data.get("conn_id").and_then(|v| v.as_u64()).unwrap_or(0);
++        if conn_id != 0 {
++            let bytes = ssl_event_bytes(ssl_data, data_str);
++            let rw = u8::from(
++                ssl_data
++                    .get("function")
++                    .and_then(|v| v.as_str())
++                    .is_some_and(|f| f.starts_with("WRITE")),
++            );
++            if let Feed::Consumed(messages) = http1.feed(&event, conn_id, rw, &bytes) {
++                return messages
++                    .into_iter()
++                    .filter_map(|m| create_http1_event(m, conn_id, websocket, include_raw_data))
++                    .collect();
++            }
++        }
++
+         // Only process if it's HTTP data AND can be parsed as a complete HTTP message
+         if Self::is_http_data(data_str)
+             && let Some(parsed_message) = Self::parse_http_message(data_str)
+@@ -329,11 +354,7 @@ impl HTTPParser {
+             )];
+         }
+ 
+-        let data_bytes = ssl_data
+-            .get("data_hex")
+-            .and_then(|v| v.as_str())
+-            .and_then(|v| hex::decode(v).ok())
+-            .unwrap_or_else(|| ssl_json_string_to_bytes(data_str));
++        let data_bytes = ssl_event_bytes(ssl_data, data_str);
+         if let Some(events) = websocket.handle_event(&event, &data_bytes, include_raw_data) {
+             return events;
+         }
+@@ -476,6 +497,8 @@ fn create_websocket_request_event(
+         total_size: headers_size(headers) + body.len(),
+         original_source: "ssl.websocket".to_string(),
+         raw_data: include_raw_data.then(|| body.clone()),
++        conn_id: None,
++        thread_tid: None,
+         body: Some(body),
+     }
+     .to_event(original_event)
+@@ -801,6 +824,8 @@ fn create_http2_request_event(
+         original_source: "ssl.http2".to_string(),
+         raw_data: include_raw_data
+             .then(|| String::from_utf8_lossy(&state.request_body).to_string()),
++        conn_id: None,
++        thread_tid: None,
+     }
+     .to_event(original_event)
+ }
+@@ -840,6 +865,8 @@ fn create_http2_response_event(
+         original_source: "ssl.http2".to_string(),
+         raw_data: include_raw_data
+             .then(|| String::from_utf8_lossy(&state.response_body).to_string()),
++        conn_id: None,
++        thread_tid: None,
+     }
+     .to_event(original_event)
+ }
+@@ -861,6 +888,69 @@ fn headers_size(headers: &HashMap<String, String>) -> usize {
+     headers.iter().map(|(k, v)| k.len() + v.len()).sum()
+ }
+ 
++/// Exact payload bytes of an sslsniff event: `data_hex` when present (the JSON
++/// text form can't round-trip bytes >= 0x80), else the text form.
++fn ssl_event_bytes(ssl_data: &serde_json::Value, data_str: &str) -> Vec<u8> {
++    ssl_data
++        .get("data_hex")
++        .and_then(|v| v.as_str())
++        .and_then(|v| hex::decode(v).ok())
++        .unwrap_or_else(|| ssl_json_string_to_bytes(data_str))
++}
++
++/// Build the http_parser event for a message reassembled from one connection.
++/// `tid` carries the connection id so that request/response pairing and SSE
++/// merging stay per connection; the real thread id goes in `thread_tid`.
++fn create_http1_event(
++    message: Http1Message,
++    conn_id: u64,
++    websocket: &mut WebSocketState,
++    include_raw_data: bool,
++) -> Option<Event> {
++    let head = String::from_utf8_lossy(&message.head).into_owned();
++    let parsed = HTTPParser::parse_http_message(&format!("{head}\r\n\r\n"))?;
++    websocket.observe_handshake(&message.first_event, &parsed);
++    let mut headers = parsed.headers;
++    if message.was_chunked {
++        // The body below is already de-chunked.
++        headers.retain(|k, _| !k.eq_ignore_ascii_case("transfer-encoding"));
++    }
++    let body_bytes = message.body;
++    let body = (!body_bytes.is_empty()).then(|| String::from_utf8_lossy(&body_bytes).into_owned());
++    let message_type = match parsed.message_type {
++        HTTPMessageType::Request => "request",
++        HTTPMessageType::Response => "response",
++    };
++    let mut event = HTTPEvent {
++        tid: conn_id,
++        message_type: message_type.to_string(),
++        first_line: parsed.first_line,
++        method: parsed.method,
++        path: parsed.path,
++        protocol: parsed.protocol,
++        status_code: parsed.status_code,
++        status_text: parsed.status_text,
++        headers,
++        has_body: body.is_some(),
++        body_hex: body.as_ref().map(|_| hex::encode(&body_bytes)),
++        body,
++        total_size: message.head.len() + 4 + body_bytes.len(),
++        is_chunked: false,
++        content_length: Some(body_bytes.len()),
++        original_source: "ssl.http1".to_string(),
++        raw_data: include_raw_data
++            .then(|| format!("{head}\r\n\r\n{}", String::from_utf8_lossy(&body_bytes))),
++        conn_id: Some(conn_id),
++        thread_tid: message.first_event.data.get("tid").and_then(|v| v.as_u64()),
++    }
++    .to_event(&message.first_event);
++    if message_type == "response" {
++        // A response (e.g. an SSE stream) ends when its last byte arrives.
++        event.timestamp = message.last_timestamp;
++    }
++    Some(event)
++}
++
+ fn ssl_json_string_to_bytes(data: &str) -> Vec<u8> {
+     let mut bytes = Vec::with_capacity(data.len());
+     for ch in data.chars() {
+@@ -881,10 +971,17 @@ impl Analyzer for HTTPParser {
+         let include_raw_data = self.include_raw_data;
+         let mut http2 = std::mem::take(&mut self.http2);
+         let mut websocket = std::mem::take(&mut self.websocket);
++        let mut http1 = std::mem::take(&mut self.http1);
+ 
+         let processed_stream = stream.flat_map(move |event| {
+             let events = if event.source == "ssl" {
+-                Self::handle_ssl_event(&mut http2, &mut websocket, event, include_raw_data)
++                Self::handle_ssl_event(
++                    &mut http1,
++                    &mut http2,
++                    &mut websocket,
++                    event,
++                    include_raw_data,
++                )
+             } else {
+                 vec![event]
+             };
+@@ -1177,6 +1274,197 @@ sec-websocket-extensions: permessage-deflate\r\n\r\n"
+         assert_eq!(calls[0].finish_reason.as_deref(), Some("stop"));
+     }
+ 
++    /// sslsniff event as emitted with connection tracking: exact bytes in
++    /// data_hex, and a `data` text form that must not be relied on.
++    fn tracked_ssl_event(ts: u64, function: &str, conn_id: u64, bytes: &[u8]) -> Event {
++        Event::new_with_timestamp(
++            ts,
++            "ssl".to_string(),
++            4242,
++            "HTTP Client".to_string(),
++            json!({
++                "tid": 7,
++                "conn_id": conn_id,
++                "function": function,
++                "len": bytes.len(),
++                "buf_size": bytes.len(),
++                "data": "<lossy text form>",
++                "data_hex": hex::encode(bytes),
++            }),
++        )
++    }
++
++    fn gzip(bytes: &[u8]) -> Vec<u8> {
++        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
++        encoder.write_all(bytes).unwrap();
++        encoder.finish().unwrap()
++    }
++
++    fn chunked(body: &[u8], chunk: usize) -> Vec<u8> {
++        let mut out = Vec::new();
++        for part in body.chunks(chunk) {
++            out.extend(format!("{:x}\r\n", part.len()).into_bytes());
++            out.extend(part);
++            out.extend(b"\r\n");
++        }
++        out.extend(b"0\r\n\r\n");
++        out
++    }
++
++    /// The Claude Code shape captured live on 2.1.281: gzip request split over
++    /// 16 KB writes, chunked gzip SSE response, and another connection's
++    /// traffic interleaved on the same thread.
++    #[tokio::test]
++    async fn claude_code_http1_gzip_capture_reaches_materialized_view() {
++        const API: u64 = 0x5555_0000_1000;
++        const MCP: u64 = 0x5555_0000_2000;
++        let prompt = format!("Reply with: café naïve £5 © {}", "x".repeat(60_000));
++        let request_json = json!({
++            "model": "claude-opus-5-5",
++            "max_tokens": 64,
++            "metadata": {"user_id": "user_abc_account_def_session_sess-claude"},
++            "messages": [{"role": "user", "content": prompt}],
++        })
++        .to_string();
++        let request_body = gzip(request_json.as_bytes());
++        let mut request = format!(
++            "POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer secret\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
++            request_body.len()
++        )
++        .into_bytes();
++        request.extend(&request_body);
++
++        let sse = concat!(
++            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[],\"usage\":{\"input_tokens\":6,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":200,\"output_tokens\":1}}}\n\n",
++            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
++            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"café naïve £5 ©\"}}\n\n",
++            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
++            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
++            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
++        );
++        let response_body = chunked(&gzip(sse.as_bytes()), 40);
++        let mut response_head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\nrequest-id: req_01\r\n\r\n".to_vec();
++        let split = response_body.len() / 2;
++        response_head.extend(&response_body[..split]);
++
++        let mcp_request = b"POST /v1/mcp/srv HTTP/1.1\r\nHost: mcp-proxy.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
++        let mcp_response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n1d\r\nevent: message\ndata: {\"id\":1}\n\n\r\n0\r\n\r\n";
++
++        let mut events = Vec::new();
++        for (i, part) in request.chunks(16_384).enumerate() {
++            events.push(tracked_ssl_event(10 + i as u64, "WRITE/SEND", API, part));
++        }
++        events.push(tracked_ssl_event(50, "WRITE/SEND", MCP, mcp_request));
++        events.push(tracked_ssl_event(60, "READ/RECV", API, &response_head));
++        events.push(tracked_ssl_event(70, "READ/RECV", MCP, mcp_response));
++        events.push(tracked_ssl_event(80, "READ/RECV", API, &response_body[split..]));
++        // Claude's Datadog telemetry for the same call (must not be counted
++        // again) and for a call whose response wasn't captured (fallback).
++        const DD: u64 = 0x5555_0000_3000;
++        let telemetry = json!([
++            {"message": "tengu_api_success", "model": "claude-opus-5-5", "input_tokens": 6, "output_tokens": 9, "cached_input_tokens": 300},
++            {"message": "tengu_api_success", "model": "claude-opus-5-5", "input_tokens": 1, "output_tokens": 2, "cached_input_tokens": 0},
++        ])
++        .to_string();
++        let mut dd = format!(
++            "POST /api/v2/logs HTTP/1.1\r\nHost: http-intake.logs.us5.datadoghq.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
++            telemetry.len()
++        )
++        .into_bytes();
++        dd.extend(telemetry.as_bytes());
++        events.push(tracked_ssl_event(90, "WRITE/SEND", DD, &dd));
++
++        let input: EventStream = Box::pin(stream::iter(events));
++        let mut pre_sse = SSEProcessor::new().defer_connection_tracked_ssl();
++        let staged = pre_sse.process(input).await.unwrap();
++        let mut parser = HTTPParser::new().disable_raw_data();
++        let parsed = parser.process(staged).await.unwrap();
++        let mut decompressor = HTTPDecompressor::new();
++        let decompressed = decompressor.process(parsed).await.unwrap();
++        let mut sse_processor = SSEProcessor::new();
++        let output: Vec<Event> = sse_processor.process(decompressed).await.unwrap().collect().await;
++
++        // No raw SSL fragments leak through; each message comes out once.
++        assert!(output.iter().all(|e| e.source != "ssl"), "raw ssl events left: {output:?}");
++        let llm_request = output
++            .iter()
++            .find(|e| e.data["path"] == "/v1/messages?beta=true")
++            .expect("reassembled /v1/messages request");
++        assert_eq!(llm_request.data["decompressed"], true);
++        assert_eq!(llm_request.data["tid"], API);
++        assert_eq!(llm_request.data["thread_tid"], 7);
++        let body: serde_json::Value =
++            serde_json::from_str(llm_request.data["body"].as_str().unwrap()).unwrap();
++        assert_eq!(body["messages"][0]["content"], prompt);
++        let merged = output
++            .iter()
++            .find(|e| e.source == "sse_processor" && e.data["tid"] == API)
++            .expect("merged SSE response on the API connection");
++        assert!(merged.data.to_string().contains("café naïve £5 ©"));
++
++        let mut view = MaterializedView::new();
++        for event in &output {
++            view.ingest_event(event).unwrap();
++        }
++        let snapshot = view.export_snapshot(crate::model::SnapshotOptions { audit_limit: 0 });
++        assert_eq!(snapshot.summary.llm_calls, 1, "{:?}", snapshot.summary);
++        // The captured call once (response usage, telemetry copy skipped), plus
++        // the telemetry-only call.
++        assert_eq!(snapshot.summary.token_usage_rows, 2, "{:?}", snapshot.summary);
++        assert_eq!(snapshot.summary.input_tokens, 6 + 1);
++        assert_eq!(snapshot.summary.output_tokens, 9 + 2);
++        assert_eq!(snapshot.summary.total_tokens, 315 + 3); // 6 + 100 cache write + 200 cache read + 9, + 1 + 2
++        let calls = view.llm_call_rows(10);
++        assert_eq!(calls[0].status, "complete");
++        assert_eq!(calls[0].model.as_deref(), Some("claude-opus-5-5"));
++        assert_eq!(calls[0].finish_reason.as_deref(), Some("end_turn"));
++    }
++
++    /// Rate-limited call followed by other traffic on the same keep-alive
++    /// connection: the 429 (with Anthropic's `request-id` header) must close
++    /// the pending call, and the later response must not be taken for it.
++    #[tokio::test]
++    async fn rate_limited_call_pairs_and_later_traffic_stays_separate() {
++        const API: u64 = 0x5555_0000_4000;
++        let body = json!({"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}).to_string();
++        let request = format!(
++            "POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.anthropic.com\r\nx-client-request-id: client-1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
++            body.len()
++        );
++        let error = r#"{"type":"error","error":{"type":"rate_limit_error","message":"limit"},"request_id":"req_429"}"#;
++        let response = format!(
++            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nrequest-id: req_429\r\nContent-Length: {}\r\n\r\n{error}",
++            error.len()
++        );
++        let batch = r#"{"events":[]}"#;
++        let log_request = format!(
++            "POST /api/event_logging/v2/batch HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{batch}",
++            batch.len()
++        );
++        let accepted = r#"{"accepted_count":1,"rejected_count":0}"#;
++        let log_response = format!(
++            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nrequest-id: req_log\r\nContent-Length: {}\r\n\r\n{accepted}",
++            accepted.len()
++        );
++        let input: EventStream = Box::pin(stream::iter(vec![
++            tracked_ssl_event(10, "WRITE/SEND", API, request.as_bytes()),
++            tracked_ssl_event(20, "READ/RECV", API, response.as_bytes()),
++            tracked_ssl_event(30, "WRITE/SEND", API, log_request.as_bytes()),
++            tracked_ssl_event(40, "READ/RECV", API, log_response.as_bytes()),
++        ]));
++        let mut parser = HTTPParser::new().disable_raw_data();
++        let output: Vec<Event> = parser.process(input).await.unwrap().collect().await;
++        let mut view = MaterializedView::new();
++        for event in &output {
++            view.ingest_event(event).unwrap();
++        }
++        let calls = view.llm_call_rows(10);
++        assert_eq!(calls.len(), 1, "{calls:?}");
++        assert_eq!(calls[0].status, "error");
++        assert_eq!(calls[0].status_code, Some(429));
++        assert_eq!(calls[0].model.as_deref(), Some("claude-opus-5-5"));
++    }
++
+     #[test]
+     fn rejects_non_http2_frames() {
+         assert!(parse_http2_frames(b"GET / HTTP/1.1\r\n\r\n").is_none());
+diff --git a/ext/analysis/src/analyzers/mod.rs b/ext/analysis/src/analyzers/mod.rs
+index a1d5053..ce38305 100644
+--- a/ext/analysis/src/analyzers/mod.rs
++++ b/ext/analysis/src/analyzers/mod.rs
+@@ -8,6 +8,7 @@ pub mod common;
+ mod filter_base;
+ mod filter_metrics;
+ pub mod http_decompressor;
++mod http1_stream;
+ pub mod http_filter;
+ pub mod http_parser;
+ pub mod materializing;
+diff --git a/ext/analysis/src/analyzers/protocol_events.rs b/ext/analysis/src/analyzers/protocol_events.rs
+index 9f4deca..28ecc0f 100644
+--- a/ext/analysis/src/analyzers/protocol_events.rs
++++ b/ext/analysis/src/analyzers/protocol_events.rs
+@@ -71,6 +71,12 @@ pub struct HTTPEvent {
+     pub content_length: Option<usize>,
+     pub original_source: String,
+     pub raw_data: Option<String>,
++    /// TLS connection the message was reassembled from (sslsniff `conn_id`).
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub conn_id: Option<u64>,
++    /// Real thread id when `tid` holds a per-connection synthetic id.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub thread_tid: Option<u64>,
+ }
+ 
+ impl HTTPEvent {
+diff --git a/ext/analysis/src/analyzers/sse_processor.rs b/ext/analysis/src/analyzers/sse_processor.rs
+index 276f2d4..7229590 100644
+--- a/ext/analysis/src/analyzers/sse_processor.rs
++++ b/ext/analysis/src/analyzers/sse_processor.rs
+@@ -18,6 +18,10 @@ pub struct SSEProcessor {
+     sse_buffers: Arc<Mutex<HashMap<String, SSEAccumulator>>>,
+     timeout_ms: u64,
+     max_buffers: usize,
++    /// Leave raw `ssl` events that carry a `conn_id` to the HTTP parser, which
++    /// reassembles them per connection. Set on the instance that runs before
++    /// the parser; accumulating those chunks here would take them away from it.
++    defer_connection_tracked_ssl: bool,
+ }
+ 
+ impl Default for SSEProcessor {
+@@ -68,9 +72,16 @@ impl SSEProcessor {
+             sse_buffers: Arc::new(Mutex::new(HashMap::new())),
+             timeout_ms,
+             max_buffers: MAX_BUFFERS,
++            defer_connection_tracked_ssl: false,
+         }
+     }
+ 
++    /// See `defer_connection_tracked_ssl`.
++    pub fn defer_connection_tracked_ssl(mut self) -> Self {
++        self.defer_connection_tracked_ssl = true;
++        self
++    }
++
+     pub fn is_sse_data(data: &str) -> bool {
+         let has_sse_patterns = data.contains("event:") && data.contains("data:");
+         let has_sse_content_type = data.contains("text/event-stream");
+@@ -853,11 +864,18 @@ impl Analyzer for SSEProcessor {
+         let sse_buffers = Arc::clone(&self.sse_buffers);
+         let timeout_ms = self.timeout_ms;
+         let max_buffers = self.max_buffers;
++        let defer_tracked = self.defer_connection_tracked_ssl;
+ 
+         let processed_stream = stream.filter_map(move |event| {
+             let buffers = Arc::clone(&sse_buffers);
+ 
+             async move {
++                if defer_tracked
++                    && event.source == "ssl"
++                    && event.data.get("conn_id").and_then(|v| v.as_u64()).unwrap_or(0) != 0
++                {
++                    return Some(event);
++                }
+                 let Some((data_str, allow_json_fragment)) = Self::sse_payload(&event) else {
+                     return Some(event);
+                 };
+diff --git a/ext/analysis/src/sources/agent_native.rs b/ext/analysis/src/sources/agent_native.rs
+index cafbc72..49966ef 100644
+--- a/ext/analysis/src/sources/agent_native.rs
++++ b/ext/analysis/src/sources/agent_native.rs
+@@ -761,6 +761,31 @@ pub fn import_recent(view: &mut MaterializedView, limit: usize) {
+     import_into_view(view, &sessions);
+ }
+ 
++/// Import sessions and their tool calls but not their LLM-call and token rows.
++/// Used when a recording already holds those calls from the API traffic, so
++/// the transcript's totals would count them a second time.
++pub fn import_into_view_without_usage(view: &mut MaterializedView, sessions: &[LocalSession]) {
++    for session in sessions {
++        view.upsert_session(&session_row(session));
++        for row in tool_rows(session) {
++            view.apply_tool_call(&row);
++        }
++    }
++}
++
++/// PIDs whose recorded file events touched this session's transcript.
++pub fn transcript_writer_pids(
++    session: &LocalSession,
++    audit_rows: &[AuditEventRow],
++) -> HashSet<u32> {
++    audit_rows
++        .iter()
++        .filter(|row| row.audit_type == "file")
++        .filter(|row| audit_file_paths(row).iter().any(|p| *p == session.path))
++        .filter_map(|row| row.pid)
++        .collect()
++}
++
+ pub fn import_into_view(view: &mut MaterializedView, sessions: &[LocalSession]) {
+     for session in sessions {
+         view.upsert_session(&session_row(session));
+diff --git a/ext/analysis/src/sources/sqlite.rs b/ext/analysis/src/sources/sqlite.rs
+index 1ff5d70..53b5241 100644
+--- a/ext/analysis/src/sources/sqlite.rs
++++ b/ext/analysis/src/sources/sqlite.rs
+@@ -7,7 +7,7 @@ use crate::sources::agent_native;
+ use crate::text::{clean_prompt_text, extract_prompt_text, truncate_text};
+ use crate::view::MaterializedView;
+ use serde_json::{Value, json};
+-use std::collections::BTreeSet;
++use std::collections::{BTreeSet, HashSet};
+ use std::path::Path;
+ 
+ const PROMPT_DEDUP_WINDOW_MS: u64 = 10_000;
+@@ -77,7 +77,23 @@ fn load_view_inner(
+     if include_observed_session_prompts {
+         import_observed_process_nodes(&mut view, &llm_rows, &process_pids);
+         let observed_sessions = agent_native::observed_sessions_from_audit_rows(&audit_rows);
+-        agent_native::import_into_view(&mut view, &observed_sessions);
++        // Sessions whose process already has LLM calls captured from its API
++        // traffic contribute their session and tool rows only; the transcript's
++        // LLM/token totals would duplicate those calls.
++        let traffic_llm_pids: HashSet<u32> = llm_rows
++            .iter()
++            .filter(|row| row.view_source != crate::model::AGENT_NATIVE_SOURCE)
++            .filter_map(|row| row.pid)
++            .collect();
++        for session in &observed_sessions {
++            let one = std::slice::from_ref(session);
++            let writers = agent_native::transcript_writer_pids(session, &audit_rows);
++            if writers.iter().any(|pid| traffic_llm_pids.contains(pid)) {
++                agent_native::import_into_view_without_usage(&mut view, one);
++            } else {
++                agent_native::import_into_view(&mut view, one);
++            }
++        }
+         let current_llm_rows = view.llm_call_rows(usize::MAX);
+         let mut prompt_rows = llm_call_prompt_rows(&current_llm_rows);
+         let mut local_prompt_rows = agent_native::observed_session_prompt_rows(&audit_rows);
+diff --git a/ext/analysis/src/view/mod.rs b/ext/analysis/src/view/mod.rs
+index bfd2f04..e345e22 100644
+--- a/ext/analysis/src/view/mod.rs
++++ b/ext/analysis/src/view/mod.rs
+@@ -41,6 +41,9 @@ pub struct MaterializedView {
+     audit_order: VecDeque<String>,
+     sinks: Vec<Box<dyn ViewSink>>,
+     pending: HashMap<(u32, u64), VecDeque<PendingRequest>>,
++    /// Usage already taken from API responses, per (pid, input, output), so
++    /// Claude's own telemetry copy of the same call isn't counted again.
++    response_usage_seen: HashMap<(u32, i64, i64), u32>,
+     active_processes: HashMap<u32, String>,
+     counts: ViewCounts,
+     start_timestamp_ms: Option<u64>,
+@@ -98,6 +101,7 @@ impl MaterializedView {
+             audit_order: self.audit_order.clone(),
+             sinks: Vec::new(),
+             pending: self.pending.clone(),
++            response_usage_seen: self.response_usage_seen.clone(),
+             active_processes: self.active_processes.clone(),
+             counts: self.counts.clone(),
+             start_timestamp_ms: self.start_timestamp_ms,
+diff --git a/ext/analysis/src/view/projection.rs b/ext/analysis/src/view/projection.rs
+index 8f5cae3..55c566b 100644
+--- a/ext/analysis/src/view/projection.rs
++++ b/ext/analysis/src/view/projection.rs
+@@ -118,10 +118,15 @@ impl MaterializedView {
+         resp: &CanonicalEvent,
+     ) -> Option<(PendingRequest, f32)> {
+         let requests = self.pending.get_mut(&(pid, tid))?;
+-        let (req, confidence) = if let Some(resp_request_id) = resp.request_id.as_deref() {
+-            let pos = requests
++        // A response id that matches no pending request (e.g. Anthropic's
++        // `request-id` header vs. the client's `x-client-request-id`) is not a
++        // reason to give up: fall back to the positional rules below.
++        let by_id = resp.request_id.as_deref().and_then(|resp_request_id| {
++            requests
+                 .iter()
+-                .position(|req| req.request_id.as_deref() == Some(resp_request_id))?;
++                .position(|req| req.request_id.as_deref() == Some(resp_request_id))
++        });
++        let (req, confidence) = if let Some(pos) = by_id {
+             (requests.remove(pos)?, 0.95)
+         } else if requests.len() == 1 {
+             (requests.pop_front()?, 0.75)
+@@ -358,6 +363,10 @@ impl MaterializedView {
+                 "response_usage",
+                 confidence,
+             );
++            *self
++                .response_usage_seen
++                .entry((pid, usage.input_tokens, usage.output_tokens))
++                .or_default() += 1;
+             self.emit_token_usage(row.clone())?;
+             usage_row = Some(row);
+         }
+@@ -400,6 +409,14 @@ impl MaterializedView {
+                 if total <= 0 {
+                     continue;
+                 }
++                // Telemetry is sent after the call completes, so when the API
++                // response itself was captured its usage is already recorded.
++                if let Some(seen) = self.response_usage_seen.get_mut(&(pid, input, output))
++                    && *seen > 0
++                {
++                    *seen -= 1;
++                    continue;
++                }
+                 let model = item
+                     .get("model")
+                     .and_then(Value::as_str)
+@@ -1010,6 +1027,8 @@ fn metadata_user_session_id(body: &Value) -> Option<String> {
+ fn finish_reason_from_body(body: &Value) -> Option<String> {
+     string_at(body, &["finish_reason"])
+         .or_else(|| string_at(body, &["stop_reason"]))
++        // Anthropic streaming: message_delta carries {"delta":{"stop_reason":...}}
++        .or_else(|| string_at(body, &["delta", "stop_reason"]))
+         .or_else(|| string_at(body, &["choices", "0", "finish_reason"]))
+         .or_else(|| string_at(body, &["candidates", "0", "finishReason"]))
+         .or_else(|| finish_reason_from_sse(body))
