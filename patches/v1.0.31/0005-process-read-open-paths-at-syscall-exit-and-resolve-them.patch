@@ -1,0 +1,272 @@
+diff --git a/bpf/process.bpf.c b/bpf/process.bpf.c
+index d54ac37..8e7153b 100644
+--- a/bpf/process.bpf.c
++++ b/bpf/process.bpf.c
+@@ -224,105 +224,107 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
+ 	return 0;
+ }
+ 
+-/* Syscall tracepoint for openat */
+-SEC("tp/syscalls/sys_enter_openat")
+-int trace_openat(struct syscall_trace_enter *ctx)
++/*
++ * open()/openat() capture. The filename is read at syscall *exit*, not entry:
++ * at entry the user string may not be paged in yet, bpf_probe_read_user_str()
++ * cannot fault it in, and the event used to be dropped silently. By exit the
++ * kernel has copied the string, so the page is resident. The entry handlers
++ * only stash the arguments.
++ */
++struct open_args_t {
++	u64 filename;
++	int flags;
++	int dfd;
++};
++
++struct {
++	__uint(type, BPF_MAP_TYPE_LRU_HASH);
++	__uint(max_entries, 10240);
++	__type(key, u64);
++	__type(value, struct open_args_t);
++} open_args SEC(".maps");
++
++static __always_inline int stash_open_args(int dfd, const char *filename, int flags)
+ {
+-	struct event *e;
+-	pid_t pid;
+-	char filepath[MAX_FILENAME_LEN];
+-	int dfd, flags;
+-	const char *filename;
++	struct open_args_t args = {};
++	u64 id;
+ 
+ 	if (!is_cgroup_tracked())
+ 		return 0;
++	id = bpf_get_current_pid_tgid();
++	args.filename = (u64)filename;
++	args.flags = flags;
++	args.dfd = dfd;
++	bpf_map_update_elem(&open_args, &id, &args, BPF_ANY);
++	return 0;
++}
+ 
+-	pid = bpf_get_current_pid_tgid() >> 32;
+-
+-	/* Get syscall arguments */
+-	dfd = (int)ctx->args[0];
+-	filename = (const char *)ctx->args[1];
+-	flags = (int)ctx->args[2];
++static __always_inline int emit_open_event(void)
++{
++	u64 id = bpf_get_current_pid_tgid();
++	struct open_args_t *args;
++	struct event *e;
+ 
+-	/* Read filename from user space */
+-	if (bpf_probe_read_user_str(filepath, sizeof(filepath), filename) < 0)
++	args = bpf_map_lookup_elem(&open_args, &id);
++	if (!args)
+ 		return 0;
+ 
+-	/* Reserve sample from BPF ringbuf */
+ 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+-	if (!e)
++	if (!e) {
++		bpf_map_delete_elem(&open_args, &id);
++		return 0;
++	}
++	if (bpf_probe_read_user_str(e->file_op.filepath, sizeof(e->file_op.filepath),
++				    (const char *)args->filename) < 0) {
++		bpf_ringbuf_discard(e, 0);
++		bpf_map_delete_elem(&open_args, &id);
+ 		return 0;
++	}
+ 
+-	/* Fill out the event */
+ 	e->type = EVENT_TYPE_FILE_OPERATION;
+-	e->pid = pid;
+-	e->ppid = 0; /* Will be filled if needed */
++	e->pid = id >> 32;
++	e->ppid = 0;
+ 	e->exit_code = 0;
+ 	e->duration_ns = 0;
+ 	e->timestamp_ns = bpf_ktime_get_ns();
+ 	e->exit_event = false;
+ 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
+-
+-	/* Copy filepath and set file open details */
+-	bpf_probe_read_kernel_str(e->file_op.filepath, sizeof(e->file_op.filepath), filepath);
+-	e->file_op.fd = -1; /* Will be set on return if needed */
+-	e->file_op.flags = flags;
++	e->file_op.fd = args->dfd;   /* directory fd, for resolving relative paths */
++	e->file_op.flags = args->flags;
+ 	e->file_op.is_open = true;
+ 
+-	/* Submit to user-space */
++	bpf_map_delete_elem(&open_args, &id);
+ 	bpf_ringbuf_submit(e, 0);
+ 	return 0;
+ }
+ 
++/* Syscall tracepoint for openat */
++SEC("tp/syscalls/sys_enter_openat")
++int trace_openat(struct syscall_trace_enter *ctx)
++{
++	return stash_open_args((int)ctx->args[0], (const char *)ctx->args[1], (int)ctx->args[2]);
++}
++
++SEC("tp/syscalls/sys_exit_openat")
++int trace_openat_exit(struct syscall_trace_exit *ctx)
++{
++	return emit_open_event();
++}
++
+ /* Syscall tracepoint for open */
+ SEC("tp/syscalls/sys_enter_open")
+ int trace_open(struct syscall_trace_enter *ctx)
+ {
+-	struct event *e;
+-	pid_t pid;
+-	char filepath[MAX_FILENAME_LEN];
+-	int flags;
+-	const char *filename;
+-
+-	if (!is_cgroup_tracked())
+-		return 0;
+-
+-	pid = bpf_get_current_pid_tgid() >> 32;
+-
+-	/* Get syscall arguments */
+-	filename = (const char *)ctx->args[0];
+-	flags = (int)ctx->args[1];
+-
+-	/* Read filename from user space */
+-	if (bpf_probe_read_user_str(filepath, sizeof(filepath), filename) < 0)
+-		return 0;
+-
+-	/* Reserve sample from BPF ringbuf */
+-	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+-	if (!e)
+-		return 0;
+-
+-	/* Fill out the event */
+-	e->type = EVENT_TYPE_FILE_OPERATION;
+-	e->pid = pid;
+-	e->ppid = 0;
+-	e->exit_code = 0;
+-	e->duration_ns = 0;
+-	e->timestamp_ns = bpf_ktime_get_ns();
+-	e->exit_event = false;
+-	bpf_get_current_comm(&e->comm, sizeof(e->comm));
+-
+-	/* Copy filepath and set file open details */
+-	bpf_probe_read_kernel_str(e->file_op.filepath, sizeof(e->file_op.filepath), filepath);
+-	e->file_op.fd = -1;
+-	e->file_op.flags = flags;
+-	e->file_op.is_open = true;
++	return stash_open_args(-100 /* AT_FDCWD */, (const char *)ctx->args[0], (int)ctx->args[1]);
++}
+ 
+-	/* Submit to user-space */
+-	bpf_ringbuf_submit(e, 0);
+-	return 0;
++SEC("tp/syscalls/sys_exit_open")
++int trace_open_exit(struct syscall_trace_exit *ctx)
++{
++	return emit_open_event();
+ }
+ 
++
+ #include "process_ext/bpf_fs.h"
+ #include "process_ext/bpf_write.h"
+ #include "process_ext/bpf_net.h"
+diff --git a/bpf/process.c b/bpf/process.c
+index 5d86ed6..bbe80e3 100644
+--- a/bpf/process.c
++++ b/bpf/process.c
+@@ -12,6 +12,7 @@
+ #include <stdlib.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <limits.h>
+ #include "process.h"
+ #include "process.skel.h"
+ #include "process_utils.h"
+@@ -759,6 +760,53 @@ static int seed_initial_pids(struct pid_tracker *tracker)
+ 	return tracked_count;
+ }
+ 
++/*
++ * Make a FILE_OPEN path absolute, from the target process's point of view:
++ *   /proc/self/fd/N/rest  -> readlink(/proc/<pid>/fd/N) + /rest
++ *   relative, dfd=AT_FDCWD -> readlink(/proc/<pid>/cwd) + /path
++ *   relative, dfd>=0       -> readlink(/proc/<pid>/fd/<dfd>) + /path
++ * Best effort: if the link can't be read (fd closed, process gone), or the
++ * result doesn't fit, the original path is kept.
++ */
++static void resolve_open_path(struct event *e)
++{
++	char link[64], base[PATH_MAX], out[PATH_MAX];
++	const char *path = e->file_op.filepath;
++	const char *rest = NULL;
++	ssize_t n;
++
++	if (strncmp(path, "/proc/self/fd/", 14) == 0) {
++		char *end;
++		long fd = strtol(path + 14, &end, 10);
++		if (end == path + 14 || (*end != '/' && *end != '\0'))
++			return;
++		snprintf(link, sizeof(link), "/proc/%d/fd/%ld", e->pid, fd);
++		rest = end;  /* "" or "/..." */
++	} else if (path[0] != '/' && path[0] != '\0') {
++		if (e->file_op.fd == AT_FDCWD)
++			snprintf(link, sizeof(link), "/proc/%d/cwd", e->pid);
++		else if (e->file_op.fd >= 0)
++			snprintf(link, sizeof(link), "/proc/%d/fd/%d", e->pid, e->file_op.fd);
++		else
++			return;
++		rest = NULL;
++	} else {
++		return;
++	}
++
++	n = readlink(link, base, sizeof(base) - 1);
++	if (n <= 0)
++		return;
++	base[n] = '\0';
++	if (rest)
++		n = snprintf(out, sizeof(out), "%s%s", base, rest);
++	else
++		n = snprintf(out, sizeof(out), "%s/%s", base, path);
++	if (n <= 0 || (size_t)n >= sizeof(e->file_op.filepath))
++		return;  /* keep the original rather than truncate */
++	memcpy(e->file_op.filepath, out, (size_t)n + 1);
++}
++
+ static int handle_event(void *ctx, void *data, size_t data_sz)
+ {
+ 	const struct event *e = data;
+@@ -844,9 +892,14 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
+ 				break;
+ 			}
+ 
++			// Resolve /proc/self/fd/N/... and dirfd/cwd-relative paths to
++			// absolute paths before dedup and reporting.
++			struct event resolved = *e;
++			resolve_open_path(&resolved);
++
+ 			// Get count for this FILE_OPEN operation
+ 			char warning_msg[128];
+-			uint32_t count = get_file_open_count(e, e->timestamp_ns, warning_msg, sizeof(warning_msg));
++			uint32_t count = get_file_open_count(&resolved, resolved.timestamp_ns, warning_msg, sizeof(warning_msg));
+ 
+ 			// Skip if this is a duplicate (count == 0)
+ 			if (count == 0) {
+@@ -854,7 +907,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
+ 			}
+ 
+ 			// Report the FILE_OPEN event with count
+-			print_file_open_event(e, e->timestamp_ns, count, strlen(warning_msg) > 0 ? warning_msg : NULL);
++			print_file_open_event(&resolved, resolved.timestamp_ns, count, strlen(warning_msg) > 0 ? warning_msg : NULL);
+ 			break;
+ 
+ 		default:

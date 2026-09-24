@@ -57,6 +57,12 @@ agentsight --version                # agentsight 1.0.31, installed to ~/.local/b
 |---|---|
 | `0001-bpf-use-syscall_trace-structs-for-syscalls-tracepoints.patch` | AgentSight's syscall probes use the wrong tracepoint struct. On RHEL 9 (12-byte `trace_entry`) this makes stdio capture fail to attach (`-EACCES`) and file paths come out as garbage. It changes 29 lines, types only. See the [evaluation write-up](https://github.com/bensanmorris/agentsight_eval/blob/main/RESULTS.md#f31-fix-verified-on-rhel-98). |
 
+| `0002-process-follow-descendants-that-leave-the-target-session.patch` | `record -- <cmd>` missed every command an agent runs through a tool shell in a new session (R1) |
+| `0003-sslsniff-count-and-report-ring-buffer-drops.patch` | Reports TLS events dropped because the ring buffer was full (previously silent) |
+| `0004`–`0006` (`process-…`) | Agent file writes were missing: open dedup ignored write intent, filenames were read at syscall entry (lost when not paged in), `/proc/self/fd`/relative paths weren't resolved, and write opens were rate-limited (R3) |
+
+Details and verification: [R1–R3 write-up](https://github.com/bensanmorris/agentsight_eval/blob/main/RESULTS.md#r1r3-investigated-and-fixed-locally-patches-00020006).
+
 Options: `--no-patches` builds unmodified upstream; `--patches DIR` uses a different patch directory.
 
 ### Disk space and `/tmp`

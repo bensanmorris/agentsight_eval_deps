@@ -1,0 +1,176 @@
+diff --git a/bpf/sslsniff.bpf.c b/bpf/sslsniff.bpf.c
+index 7a24e8e..80cdd74 100644
+--- a/bpf/sslsniff.bpf.c
++++ b/bpf/sslsniff.bpf.c
+@@ -48,6 +48,24 @@ struct {
+     __type(value, __u64);
+ } bufs SEC(".maps");
+ 
++/* Count events dropped because the ring buffer was full. Every event reserves
++ * sizeof(struct probe_SSL_data_t) (~256KB), so a slow consumer can exhaust the
++ * 16MB ring quickly; without this counter those drops are silent. */
++struct {
++    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
++    __uint(max_entries, 1);
++    __type(key, u32);
++    __type(value, u64);
++} ringbuf_drops SEC(".maps");
++
++static __always_inline void count_ringbuf_drop(void)
++{
++    u32 key = 0;
++    u64 *val = bpf_map_lookup_elem(&ringbuf_drops, &key);
++    if (val)
++        (*val)++;
++}
++
+ const volatile pid_t targ_pid = 0;
+ const volatile uid_t targ_uid = -1;
+ #define MAX_RUSTLS_IOVECS 2
+@@ -149,8 +167,10 @@ int BPF_UPROBE(probe_rustls_write, void *conn, const void *buf, size_t len)
+     if (!trace_allowed(uid, pid) || !buf || len == 0)
+         return 0;
+     struct probe_SSL_data_t *data = bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
+-    if (!data)
++    if (!data) {
++        count_ringbuf_drop();
+         return 0;
++    }
+     if (bpf_probe_read_user(data->buf, copied, buf)) {
+         bpf_ringbuf_discard(data, 0);
+         return 0;
+@@ -174,8 +194,10 @@ int BPF_UPROBE(probe_rustls_write_vectored, void *conn,
+         return 0;
+ 
+     struct probe_SSL_data_t *data = bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
+-    if (!data)
++    if (!data) {
++        count_ringbuf_drop();
+         return 0;
++    }
+ 
+ #pragma unroll
+     for (int i = 0; i < MAX_RUSTLS_IOVECS; i++) {
+@@ -240,8 +262,10 @@ int BPF_UPROBE(probe_rustls_buffer_plaintext, void *state,
+             ? GROK_MAX_CAPTURE_SIZE : (u32)total;
+         struct probe_SSL_data_t *data =
+             bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
+-        if (!data)
++        if (!data) {
++            count_ringbuf_drop();
+             return 0;
++        }
+         if (bpf_probe_read_user(data->buf, copied, outbound.data)) {
+             bpf_ringbuf_discard(data, 0);
+             return 0;
+@@ -258,8 +282,10 @@ int BPF_UPROBE(probe_rustls_buffer_plaintext, void *state,
+ 
+     struct probe_SSL_data_t *data =
+         bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
+-    if (!data)
++    if (!data) {
++        count_ringbuf_drop();
+         return 0;
++    }
+ 
+ #pragma unroll
+     for (int i = 0; i < MAX_GROK_IOVECS; i++) {
+@@ -331,8 +357,10 @@ static int SSL_exit(struct pt_regs *ctx, int rw) {
+ 
+     /* reserve space in ring buffer */
+     struct probe_SSL_data_t *data = bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
+-    if (!data)
++    if (!data) {
++        count_ringbuf_drop();
+         return 0;
++    }
+ 
+     data->timestamp_ns = ts;
+     data->delta_ns = delta_ns;
+@@ -444,8 +472,10 @@ static int ex_SSL_exit(struct pt_regs *ctx, int rw, int len) {
+ 
+     /* reserve space in ring buffer */
+     struct probe_SSL_data_t *data = bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
+-    if (!data)
++    if (!data) {
++        count_ringbuf_drop();
+         return 0;
++    }
+ 
+     data->timestamp_ns = ts;
+     data->delta_ns = delta_ns;
+@@ -566,8 +596,10 @@ int BPF_URETPROBE(probe_SSL_do_handshake_exit) {
+ 
+     /* reserve space in ring buffer */
+     struct probe_SSL_data_t *data = bpf_ringbuf_reserve(&rb, sizeof(*data), 0);
+-    if (!data)
++    if (!data) {
++        count_ringbuf_drop();
+         return 0;
++    }
+ 
+     data->timestamp_ns = ts;
+     data->delta_ns = ts - *tsp;
+diff --git a/bpf/sslsniff.c b/bpf/sslsniff.c
+index 20db97c..e6f2d37 100644
+--- a/bpf/sslsniff.c
++++ b/bpf/sslsniff.c
+@@ -554,6 +554,32 @@ char *find_library_path(const char *libname) {
+ 	return NULL;
+ }
+ 
++/* Report ring buffer drops (events lost because the ring was full) to stderr.
++ * Prints when the total increases, at most every 5 seconds, and once at exit. */
++static void report_ringbuf_drops(int fd, bool final)
++{
++	static unsigned long long reported = 0;
++	static time_t last = 0;
++	int ncpus = libbpf_num_possible_cpus();
++	unsigned long long total = 0;
++	__u32 key = 0;
++	time_t now = time(NULL);
++
++	if (fd < 0 || ncpus <= 0 || (!final && now - last < 5))
++		return;
++	last = now;
++	unsigned long long vals[ncpus];
++	if (bpf_map_lookup_elem(fd, &key, vals))
++		return;
++	for (int i = 0; i < ncpus; i++)
++		total += vals[i];
++	if (total > reported || (final && total > 0)) {
++		fprintf(stderr, "sslsniff: ring buffer full, dropped %llu events (total %llu)%s\n",
++			total - reported, total, final ? " at exit" : "");
++		reported = total;
++	}
++}
++
+ // Global buffer allocated once and reused
+ static char *event_buf = NULL;
+ 
+@@ -673,6 +699,7 @@ int main(int argc, char **argv) {
+ 	LIBBPF_OPTS(bpf_object_open_opts, open_opts);
+ 	struct sslsniff_bpf *obj = NULL;
+ 	struct ring_buffer *rb = NULL;
++	int drops_fd = -1;
+ 	struct codex_rustls_offsets codex_offsets = {};
+ 	bool is_codex = false;
+ 	bool codex_rustls = false;
+@@ -848,6 +875,7 @@ int main(int argc, char **argv) {
+ 		goto cleanup;
+ 	}
+ 
++	drops_fd = bpf_map__fd(obj->maps.ringbuf_drops);
+ 	while (!exiting) {
+ 		err = ring_buffer__poll(rb, PERF_POLL_TIMEOUT_MS);
+ 		if (err < 0 && err != -EINTR) {
+@@ -855,7 +883,9 @@ int main(int argc, char **argv) {
+ 			goto cleanup;
+ 		}
+ 		err = 0;
++		report_ringbuf_drops(drops_fd, false);
+ 	}
++	report_ringbuf_drops(drops_fd, true);
+ 
+ cleanup:
+ 	if (grok_rustls_link)
